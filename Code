@@ -1,0 +1,177 @@
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import cdist
+from scipy.optimize import minimize
+
+# ==========================
+# CONFIGURATION PARAMETERS
+# ==========================
+BETA = 0.5              # Closeness penalty strength (parties avoid being too close).
+THRESHOLD = 1.0         # Closeness penalty triggers when parties are closer than this.
+MOVEMENT_ALPHA = 0.001  # Movement cost (parties want to stay close to 2021 positions).
+SOCIAL_SHIFT = 2        # Rightward shift in voter social preferences.
+GAMMA = 1.5             # AfD immigration boost (reflecting issue ownership on immigration).
+
+# ==========================
+# PARTY COLOURS
+# ==========================
+party_colours = {
+    'SPD': 'red',
+    'CDU/CSU': 'black',
+    'Greens': 'green',
+    'FDP': 'gold',
+    'AfD': 'blue',
+    'LINKE': 'purple'
+}
+
+# ==========================
+# LOAD DATA & APPLY SHIFT
+# ==========================
+file_path = "C:/Users/andre/Desktop/UCL/Game Theory/Party Positions Dataset Final (version 1).xlsx"
+sheet_name = "FN P&V (2)"
+
+voters = pd.read_excel(file_path, sheet_name=sheet_name)
+voters['Party Affiliation'] = voters['Party Affiliation'].astype(str).str.strip()
+voters['Combined_Resampling_Weight'] = voters['True Weighting'] * voters['Voter likelihood']
+voters['Combined_Resampling_Weight'] /= voters['Combined_Resampling_Weight'].sum()
+voters['SOC Vot. NR'] += SOCIAL_SHIFT
+
+# ==========================
+# RESAMPLING
+# ==========================
+resampled_voters = pd.concat(
+    [voters.sample(n=len(voters), weights=voters['Combined_Resampling_Weight'], replace=True) for _ in range(100)],
+    ignore_index=True
+)
+
+# ==========================
+# PARTISAN ATTACHMENT & SPATIAL SENSITIVITY
+# ==========================
+resampled_voters['Beta'] = resampled_voters['Party Adherence Strength Corrected']
+resampled_voters['Lambda'] = np.maximum(0.1, 1 - resampled_voters['Beta'])
+resampled_voters['FLOATING'] = (resampled_voters['Party Affiliation'] == 'No party')
+
+# ==========================
+# IMMIGRATION IMPORTANCE BOOST (AFD)
+# ==========================
+resampled_voters['ImmigrationImportance'] = 0.5
+resampled_voters.loc[resampled_voters['SOC Vot. NR'] > 2, 'ImmigrationImportance'] = 0.8
+
+# ==========================
+# 2021 PARTY POSITIONS (BASELINE)
+# ==========================
+party_positions_2021 = {
+    'SPD': [-5.7952, -2.7854],
+    'CDU/CSU': [2.67, 4.1815],
+    'Greens': [-2.5368, -4.232],
+    'FDP': [4.706, -2.9924],
+    'AfD': [6.0004, 7.6484],
+    'LINKE': [-7.3968, -7.1684]
+}
+party_order = list(party_positions_2021.keys())
+
+SPD_current = np.array(party_positions_2021['SPD'])
+CDU_current = np.array(party_positions_2021['CDU/CSU'])
+
+# ==========================
+# ADHERENCE MATRIX
+# ==========================
+adherence_matrix = np.zeros((len(resampled_voters), len(party_order)))
+for i, party in enumerate(party_order):
+    adherence_matrix[:, i] = np.where(resampled_voters['Party Affiliation'] == party, resampled_voters['Beta'], 0)
+adherence_matrix[resampled_voters['FLOATING']] = 0
+
+# ==========================
+# CORE FUNCTIONS
+# ==========================
+def build_positions_dict(spd_pos, cdu_pos):
+    positions = party_positions_2021.copy()
+    positions['SPD'] = spd_pos
+    positions['CDU/CSU'] = cdu_pos
+    return positions
+
+def compute_distances(voters_df, positions):
+    voter_coords = voters_df[['ECO Vot. NR', 'SOC Vot. NR']].values
+    party_coords = np.array([positions[party] for party in party_order])
+    return cdist(voter_coords, party_coords)
+
+def compute_probabilities(voters_df, distances):
+    lam = voters_df['Lambda'].values[:, np.newaxis]
+    utilities = -lam * distances + adherence_matrix
+    utilities[:, party_order.index('AfD')] += GAMMA * voters_df['ImmigrationImportance'].values
+    exp_utilities = np.exp(utilities)
+    return exp_utilities / exp_utilities.sum(axis=1, keepdims=True)
+
+def compute_vote_shares(voters_df, spd_pos, cdu_pos):
+    positions = build_positions_dict(spd_pos, cdu_pos)
+    distances = compute_distances(voters_df, positions)
+    probabilities = compute_probabilities(voters_df, distances)
+    return {party: probabilities[:, i].mean() for i, party in enumerate(party_order)}
+
+# ==========================
+# PENALTIES
+# ==========================
+def movement_penalty(current, initial):
+    return MOVEMENT_ALPHA * np.linalg.norm(current - initial)**2
+
+def closeness_penalty(pos1, pos2):
+    distance = np.linalg.norm(pos1 - pos2)
+    return BETA * np.exp(- (distance - THRESHOLD)**2) if distance < THRESHOLD else 0
+
+# ==========================
+# OBJECTIVES
+# ==========================
+def objective_spd(spd_pos, cdu_pos):
+    return -compute_vote_shares(resampled_voters, spd_pos, cdu_pos)['SPD'] + movement_penalty(spd_pos, party_positions_2021['SPD']) + closeness_penalty(spd_pos, cdu_pos)
+
+def objective_cdu(cdu_pos, spd_pos):
+    return -compute_vote_shares(resampled_voters, spd_pos, cdu_pos)['CDU/CSU'] + movement_penalty(cdu_pos, party_positions_2021['CDU/CSU']) + closeness_penalty(cdu_pos, spd_pos)
+
+# ==========================
+# OPTIMISATION
+# ==========================
+initial_shares = compute_vote_shares(resampled_voters, SPD_current, CDU_current)
+
+tolerance = 0.01
+for iteration in range(50):
+    SPD_current = minimize(objective_spd, SPD_current, args=(CDU_current,), bounds=[(-10, 10), (-10, 10)]).x
+    CDU_current = minimize(objective_cdu, CDU_current, args=(SPD_current,), bounds=[(-10, 10), (-10, 10)]).x
+    if np.linalg.norm(SPD_current - party_positions_2021['SPD']) < tolerance and np.linalg.norm(CDU_current - party_positions_2021['CDU/CSU']) < tolerance:
+        break
+
+final_shares = compute_vote_shares(resampled_voters, SPD_current, CDU_current)
+
+# ==========================
+# OUTPUT
+# ==========================
+print("\n--- FINAL RESULTS ---")
+print(f"Converged after {iteration + 1} iterations")
+
+print("\n2021 Party Positions (Manifesto Project):")
+for party, pos in party_positions_2021.items():
+    print(f"{party}: {pos}")
+
+print("\nSPD Final:", SPD_current)
+print("CDU Final:", CDU_current)
+
+print("\nSPD Movement Distance: {:.2f}".format(np.linalg.norm(SPD_current - party_positions_2021['SPD'])))
+print("CDU Movement Distance: {:.2f}\n".format(np.linalg.norm(CDU_current - party_positions_2021['CDU/CSU'])))
+
+print("Vote Share Changes:")
+for party, initial in initial_shares.items():
+    change = final_shares[party] - initial
+    print(f"{party}: Initial={initial:.2%}, Final={final_shares[party]:.2%}, Change={change:+.2%}")
+
+def plot_kde(voters_df, spd_pos, cdu_pos):
+    plt.figure(figsize=(7, 5), dpi=100)
+    sns.kdeplot(x=voters_df['ECO Vot. NR'], y=voters_df['SOC Vot. NR'], weights=voters_df['Combined_Resampling_Weight'], fill=True, cmap="YlGnBu", levels=30, clip=[(-10, 10), (-10, 10)])
+    for party, pos in party_positions_2021.items():
+        plt.scatter(*pos, color=party_colours[party], s=70, label=f'{party} (2021)', edgecolor='black')
+    plt.scatter(*spd_pos, color='red', marker='X', s=120, label='SPD Final')
+    plt.scatter(*cdu_pos, color='black', marker='X', s=120, label='CDU Final')
+    plt.legend()
+    plt.show()
+
+plot_kde(resampled_voters, SPD_current, CDU_current)
