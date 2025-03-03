@@ -5,5 +5,5 @@ This repository contains Python code to simulate spatial party positioning dynam
 
 ### Dataset Request
 
-The **GLES 2021 Pre-election Cross-sectional Study** data, pre-processed into the format required by the model, can be made available upon request. To request access, please contact the repository owner.
+The **GLES 2021 Pre-election Cross-sectional Study and Manifest Project Dataset** data, pre-processed into the format required by the model, can be made available upon request. To request access, please contact the repository owner.
 
